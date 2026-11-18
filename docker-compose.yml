@@ -1,0 +1,23 @@
+services:
+  ridership:
+    build: .
+    image: metro-ridership:local
+    container_name: metro-ridership
+    ports:
+      - "8000:8000"
+    environment:
+      TAPS_DB: /data/taps.sqlite3
+      # Only affects how UTC is labelled in the UI; counting stays on UTC days.
+      DISPLAY_TZ: Asia/Shanghai
+    volumes:
+      - ridership-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ridership-data:

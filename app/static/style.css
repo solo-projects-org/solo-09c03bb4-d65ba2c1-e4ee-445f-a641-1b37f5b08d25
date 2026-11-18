@@ -1,0 +1,76 @@
+:root {
+  --bg: #f4f6f8;
+  --card: #ffffff;
+  --ink: #1c2430;
+  --muted: #647084;
+  --line: #dde3ea;
+  --accent: #1769e0;
+  --ok: #0f7b4a;
+  --ok-bg: #e4f5ec;
+  --warn: #9a5b00;
+  --warn-bg: #fdf1dc;
+  --bad: #a11b1b;
+  --bad-bg: #fbe6e6;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 14px;
+}
+.topbar {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px; padding: 20px 28px; background: #12233d; color: #fff;
+}
+.topbar h1 { margin: 0 0 4px; font-size: 20px; }
+.topbar .sub { margin: 0; color: #b7c4d6; font-size: 12.5px; }
+.ghost {
+  color: #dbe6f5; border: 1px solid #4a6285; border-radius: 6px;
+  padding: 6px 12px; text-decoration: none; white-space: nowrap;
+}
+main { max-width: 1080px; margin: 22px auto 60px; padding: 0 20px; display: grid; gap: 18px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; }
+.card h2 { margin: 0 0 10px; font-size: 16px; }
+.card h3 { margin: 20px 0 8px; font-size: 13.5px; color: var(--muted); font-weight: 600; }
+.hint { color: var(--muted); font-size: 12.5px; line-height: 1.7; margin: 0 0 12px; }
+code { background: #eef2f7; border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+input[type=file] { border: 1px dashed var(--line); border-radius: 8px; padding: 8px; background: #fafbfd; }
+button {
+  border: 0; border-radius: 8px; padding: 9px 16px; background: var(--accent);
+  color: #fff; font-weight: 600; cursor: pointer;
+}
+button:disabled { opacity: .55; cursor: progress; }
+.result { margin-top: 12px; padding: 12px; border-radius: 8px; background: #f5f8ff; border: 1px solid #d5e2f8; white-space: pre-wrap; font-size: 13px; }
+.result.error { background: var(--bad-bg); border-color: #f0c9c9; color: var(--bad); }
+.day-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.day-tab {
+  background: #f1f4f9; color: var(--ink); border: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 4px; align-items: flex-start; padding: 8px 12px;
+}
+.day-tab.active { border-color: var(--accent); background: #e8f0ff; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 11.5px; font-weight: 600; }
+.badge.current, .badge.done { background: var(--ok-bg); color: var(--ok); }
+.badge.stale, .badge.pending, .badge.running { background: var(--warn-bg); color: var(--warn); }
+.badge.failed { background: var(--bad-bg); color: var(--bad); }
+.day-panel { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+.panel-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.panel-head h3 { margin: 0; font-size: 15px; color: var(--ink); }
+.notice { padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; }
+.notice.stale { background: var(--warn-bg); color: var(--warn); }
+.notice.uncomputed { background: #eef2f7; color: var(--muted); }
+table.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.grid th, table.grid td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+table.grid th { color: var(--muted); font-weight: 600; font-size: 12px; }
+table.grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.small { font-size: 11.5px; }
+.empty { color: var(--muted); padding: 10px 0; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+@media (max-width: 800px) { .cols { grid-template-columns: 1fr; } }
+.stat-row { display: flex; gap: 22px; margin-bottom: 14px; flex-wrap: wrap; }
+.stat { background: #f6f8fb; border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; }
+.stat .k { color: var(--muted); font-size: 11.5px; }
+.stat .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }

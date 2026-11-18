@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>地铁站间客流 · 闸机补传</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>地铁站间客流</h1>
+    <p class="sub">闸机补传记录 → 站间人数与待核清单。日期均按 UTC 服务日统计（进站日），显示时区 {{ tz }}。</p>
+  </div>
+  <a class="ghost" href="/docs">API 文档</a>
+</header>
+
+<main>
+  <section class="card">
+    <h2>上传补传记录</h2>
+    <p class="hint">
+      CSV 表头：<code>事件号, 匿名卡号, 时刻, 站点, 方向, 修订号</code>。
+      方向填 <code>进站/出站</code> 或 <code>in/out</code>；时刻为 UTC（带 Z 或偏移）。
+      一次最多两个连续 UTC 日；同事件号更高修订号会覆盖旧记录。
+    </p>
+    <form id="upload-form" enctype="multipart/form-data">
+      <input type="file" id="csv" name="file" accept=".csv,text/csv" required>
+      <button type="submit" id="upload-btn">上传并重算</button>
+    </form>
+    <div id="upload-result" class="result" hidden></div>
+  </section>
+
+  <section class="card">
+    <h2>按日查看</h2>
+    <div class="day-tabs" id="day-tabs">
+      {% for d in days %}
+        <button class="day-tab {{ 'stale' if d.status == 'stale' }}" data-date="{{ d.date }}">
+          <span class="date">{{ d.date }}</span>
+          <span class="badge {{ d.status }}">{{ '现行' if d.status == 'current' else '待重算' }}</span>
+        </button>
+      {% else %}
+        <p class="empty">尚无数据，请先上传。</p>
+      {% endfor %}
+    </div>
+    <div id="day-panel" class="day-panel" hidden></div>
+  </section>
+
+  <section class="card">
+    <h2>批次与重算任务</h2>
+    <h3>最近上传</h3>
+    <table class="grid">
+      <thead><tr><th>批次</th><th>文件</th><th>受理时间 (UTC)</th><th>行数</th><th>新增/忽略</th><th>覆盖日期</th></tr></thead>
+      <tbody>
+      {% for b in batches %}
+        <tr>
+          <td>#{{ b.id }}</td>
+          <td class="mono">{{ b.filename }}</td>
+          <td class="mono">{{ b.received_at }}</td>
+          <td>{{ b.row_count }}</td>
+          <td>{{ b.accepted_count }} / {{ b.ignored_count }}</td>
+          <td class="mono">{{ b.day_start }}{% if b.day_end != b.day_start %} … {{ b.day_end }}{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="empty">暂无批次</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>重算任务</h3>
+    <table class="grid">
+      <thead><tr><th>任务</th><th>状态</th><th>覆盖日期</th><th>尝试</th><th>完成/错误</th></tr></thead>
+      <tbody>
+      {% for j in jobs %}
+        <tr>
+          <td>#{{ j.id }}</td>
+          <td><span class="badge {{ j.status }}">{{ j.status }}</span></td>
+          <td class="mono">{{ j.days | join(', ') }}</td>
+          <td>{{ j.attempts }}</td>
+          <td class="mono small">{{ j.finished_at or j.last_error or '' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">暂无任务</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
