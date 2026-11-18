@@ -10,7 +10,9 @@ Model
 * ``pending_taps`` – isolated / same-direction taps that could not be paired.
 * ``day_state`` – publication state per service date: ``current`` means the
   results below it were computed from the newest accepted data; ``stale``
-  means records changed since (or a recompute failed).
+  means records changed since (or a recompute failed).  ``publication_id`` is
+  a global counter bumped once per publishing transaction; paged readers bind
+  their cursor to it so a page can never bridge two publications.
 * ``day_epochs`` – monotonically increasing counter per date, bumped by every
   accepted upload that can affect that date.  It is the fencing token that
   stops a slow recompute from publishing over newer data.
@@ -77,6 +79,9 @@ CREATE TABLE IF NOT EXISTS pending_taps (
     PRIMARY KEY (service_date, event_no)
 );
 CREATE INDEX IF NOT EXISTS idx_pending_day ON pending_taps (service_date);
+-- Keyset pagination order for the review list: one index covers the day
+-- filter plus the stable (tap_time, event_no) ORDER BY / range predicate.
+CREATE INDEX IF NOT EXISTS idx_pending_day_order ON pending_taps (service_date, tap_time, event_no);
 
 CREATE TABLE IF NOT EXISTS day_state (
     service_date       TEXT PRIMARY KEY,
@@ -84,6 +89,11 @@ CREATE TABLE IF NOT EXISTS day_state (
     published_batch_id INTEGER REFERENCES batches(id),
     computed_at        TEXT,
     data_epoch         INTEGER NOT NULL DEFAULT 0,
+    -- Monotonic id assigned at every publication transaction.  Unlike
+    -- data_epoch (a fence against uploads), this changes whenever the
+    -- displayed rows are replaced, so an open pagination cursor can detect
+    -- that its page belongs to a superseded publication.
+    publication_id     INTEGER NOT NULL DEFAULT 0,
     last_error         TEXT,
     updated_at         TEXT NOT NULL
 );
@@ -129,6 +139,13 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # ``CREATE TABLE IF NOT EXISTS`` does not add columns to databases created
+    # before publication ids existed.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(day_state)")}
+    if "publication_id" not in columns:
+        conn.execute(
+            "ALTER TABLE day_state ADD COLUMN publication_id INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager

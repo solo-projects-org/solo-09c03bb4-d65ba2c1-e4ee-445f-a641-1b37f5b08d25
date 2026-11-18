@@ -1,5 +1,9 @@
 const $ = (sel) => document.querySelector(sel);
 
+// Paged review list state.  `cursor` is bound to one publication of one day;
+// it is only ever extended by appending the server's next page.
+let dayState = null;
+
 function badge(status) {
   const label = {
     current: "现行",
@@ -19,9 +23,60 @@ function esc(text) {
   }[c]));
 }
 
-function renderDay(data) {
+function pendingRow(row) {
+  return `
+    <tr><td class="mono">${esc(row.card_id)}</td>
+        <td class="mono">${esc(row.tap_time)}</td>
+        <td>${esc(row.station)}</td>
+        <td>${row.direction === "in" ? "进站" : "出站"}</td>
+        <td class="small">${esc(row.reason)}</td></tr>`;
+}
+
+function pageFooter() {
+  if (!dayState) return "";
+  if (dayState.loading) {
+    return `<div class="pager"><span class="small">正在读取第 ${dayState.page_no + 1} 页…</span></div>`;
+  }
+  if (dayState.cursor) {
+    return `<div class="pager">
+      <button class="load-more" type="button">加载下一页（已显示 ${dayState.rows.length} 条）</button>
+      <span class="small">每页最多 ${dayState.limit} 条</span>
+    </div>`;
+  }
+  if (dayState.rows.length) {
+    return `<div class="pager"><span class="small">已显示全部 ${dayState.total} 条待核记录</span></div>`;
+  }
+  return "";
+}
+
+function renderPendingTable() {
+  const host = $("#pending-host");
+  if (!host || !dayState) return;
+  host.innerHTML = dayState.rows.length
+    ? dayState.rows.map(pendingRow).join("")
+    : '<tr><td colspan="5" class="empty">当日无待核记录</td></tr>';
+  const footer = $("#pending-pager");
+  if (footer) {
+    footer.innerHTML = pageFooter();
+    footer.querySelectorAll(".load-more").forEach((el) => {
+      el.addEventListener("click", () => loadMorePending());
+    });
+  }
+}
+
+function renderDay(data, rows = []) {
   const panel = $("#day-panel");
   panel.hidden = false;
+  dayState = {
+    date: data.date,
+    publication_id: data.publication_id,
+    limit: data.page.limit,
+    cursor: data.page.next_cursor,
+    total: data.pending_total,
+    rows: rows.slice(),
+    page_no: 1,
+    loading: false,
+  };
   const head = `
     <div class="panel-head">
       <h3>${esc(data.date)} · UTC 服务日</h3>
@@ -30,6 +85,7 @@ function renderDay(data) {
     </div>`;
 
   if (data.status !== "current") {
+    dayState = null;
     const msg = data.status === "stale"
       ? `结果已过期，不能用于排班。${data.last_error ? "原因：" + esc(data.last_error) : ""} 请在下方触发重算。`
       : "该日尚未计算完成。";
@@ -42,12 +98,6 @@ function renderDay(data) {
   const pairs = data.station_pairs.map((row) => `
     <tr><td>${esc(row.from_station)} → ${esc(row.to_station)}</td>
         <td class="num">${row.trips}</td></tr>`).join("");
-  const pending = data.pending.map((row) => `
-    <tr><td class="mono">${esc(row.card_id)}</td>
-        <td class="mono">${esc(row.tap_time)}</td>
-        <td>${esc(row.station)}</td>
-        <td>${row.direction === "in" ? "进站" : "出站"}</td>
-        <td class="small">${esc(row.reason)}</td></tr>`).join("");
 
   panel.innerHTML = head + `
     <div class="stat-row">
@@ -65,12 +115,32 @@ function renderDay(data) {
       </div>
       <div>
         <h3>待核记录（不计入客流）</h3>
+        <div class="notice">待核清单分页显示，每页最多 ${esc(data.page.limit)} 条；本页与上方统计同属版本 ${esc(data.publication_id)}。补传、更正或重算后旧清单作废，须从现行结果重新开始。</div>
         <table class="grid">
           <thead><tr><th>卡号</th><th>时刻 (UTC)</th><th>站点</th><th>方向</th><th>原因</th></tr></thead>
-          <tbody>${pending || '<tr><td colspan="5" class="empty">当日无待核记录</td></tr>'}</tbody>
+          <tbody id="pending-host"></tbody>
         </table>
+        <div id="pending-pager"></div>
       </div>
     </div>`;
+  renderPendingTable();
+  bindRecompute();
+}
+
+function showStalePanel(date, message, status = null) {
+  dayState = null;
+  const panel = $("#day-panel");
+  panel.hidden = false;
+  const action = status === "current"
+    ? `<button class="reload-day" type="button" data-date="${esc(date)}">从现行结果重新加载</button>`
+    : `<button class="recompute" type="button" data-date="${esc(date)}">重算 ${esc(date)}</button>`;
+  panel.innerHTML = `
+    <div class="panel-head"><h3>${esc(date)} · UTC 服务日</h3></div>
+    <div class="notice stale">${esc(message)} 旧清单已清空，请从现行结果重新开始。</div>
+    ${action}`;
+  panel.querySelectorAll(".reload-day").forEach((el) => {
+    el.addEventListener("click", () => loadDay(el.dataset.date));
+  });
   bindRecompute();
 }
 
@@ -81,11 +151,57 @@ async function loadDay(date) {
   const res = await fetch(`/api/days/${date}`);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    $("#day-panel").hidden = false;
-    $("#day-panel").innerHTML = `<div class="notice stale">${esc(body.detail || "加载失败")}</div>`;
+    showStalePanel(date, body.detail || "加载失败");
     return;
   }
-  renderDay(await res.json());
+  const data = await res.json();
+  renderDay(data, data.pending);
+}
+
+async function loadMorePending() {
+  if (!dayState || !dayState.cursor || dayState.loading) return;
+  const state = dayState;
+  state.loading = true;
+  state.page_no += 1;
+  renderPendingTable();
+  let res;
+  try {
+    res = await fetch(
+      `/api/days/${state.date}?limit=${state.limit}&cursor=${encodeURIComponent(state.cursor)}`,
+    );
+  } catch (err) {
+    state.loading = false;
+    state.page_no -= 1;
+    renderPendingTable();
+    alert(`网络错误：${err}`);
+    return;
+  }
+  if (dayState !== state) return;      // another day was opened meanwhile
+  if (res.status === 409) {
+    const body = await res.json().catch(() => ({}));
+    await refreshTabs();
+    showStalePanel(state.date, body.detail || "该日结果已变化，旧清单作废。", body.status);
+    return;
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    state.loading = false;
+    state.page_no -= 1;
+    renderPendingTable();
+    alert(body.detail || "翻页失败");
+    return;
+  }
+  state.loading = false;
+  if (body.publication_id !== state.publication_id) {
+    // Defensive: the server should already have rejected this cursor.
+    await refreshTabs();
+    showStalePanel(state.date, "该日已换版，旧清单作废。", body.status);
+    return;
+  }
+  state.rows = state.rows.concat(body.pending);
+  state.cursor = body.page.next_cursor;
+  state.total = body.pending_total;
+  renderPendingTable();
 }
 
 document.querySelectorAll(".day-tab").forEach((el) => {

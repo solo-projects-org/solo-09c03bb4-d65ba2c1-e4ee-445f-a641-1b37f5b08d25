@@ -25,6 +25,8 @@ Publication protocol
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import sqlite3
 from collections import Counter
@@ -38,6 +40,11 @@ from .ingest import Tap, UploadError, parse_csv
 from .journeys import Event, Journey, PendingTap, derive
 
 MAX_JOB_ATTEMPTS = 5
+
+# The review list is paged, never loaded whole: one query reads at most this
+# many rows (plus one look-ahead row to decide whether another page exists).
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 100
 
 
 def utcnow() -> str:
@@ -111,6 +118,19 @@ def _bump_global_epoch(conn: sqlite3.Connection) -> int:
 def _day_epoch(conn: sqlite3.Connection, day: str) -> int:
     row = conn.execute("SELECT epoch FROM day_epochs WHERE service_date = ?", (day,)).fetchone()
     return int(row["epoch"]) if row else 0
+
+
+def _next_publication_id(conn: sqlite3.Connection) -> int:
+    """Global monotonic id, one per publication transaction.
+
+    It changes only when displayed rows are replaced, which makes it the
+    right token to bind a pagination cursor to: a cursor issued against one
+    publication can never silently continue into a newer one.
+    """
+    current = int(db.get_state(conn, "publication_seq", "0") or "0")
+    new = current + 1
+    db.set_state(conn, "publication_seq", str(new))
+    return new
 
 
 def _stale_days(
@@ -387,6 +407,7 @@ def _publish(
     pending_rows: list[PendingTap],
 ) -> None:
     now = utcnow()
+    publication_id = _next_publication_id(conn)
     for day in days:
         conn.execute("DELETE FROM results WHERE service_date = ?", (day,))
         conn.execute("DELETE FROM pending_taps WHERE service_date = ?", (day,))
@@ -408,13 +429,14 @@ def _publish(
         )
     for day in days:
         conn.execute(
-            "INSERT INTO day_state (service_date, status, published_batch_id, computed_at, data_epoch, last_error, updated_at) "
-            "VALUES (?, 'current', ?, ?, ?, NULL, ?) "
+            "INSERT INTO day_state (service_date, status, published_batch_id, computed_at, data_epoch, publication_id, last_error, updated_at) "
+            "VALUES (?, 'current', ?, ?, ?, ?, NULL, ?) "
             "ON CONFLICT(service_date) DO UPDATE SET "
             "  status = 'current', published_batch_id = excluded.published_batch_id, "
             "  computed_at = excluded.computed_at, data_epoch = excluded.data_epoch, "
+            "  publication_id = excluded.publication_id, "
             "  last_error = NULL, updated_at = excluded.updated_at",
-            (day, job["trigger_batch_id"], now, epochs[day], now),
+            (day, job["trigger_batch_id"], now, epochs[day], publication_id, now),
         )
     conn.execute(
         "UPDATE recompute_jobs SET status = 'done', finished_at = ?, last_error = NULL WHERE id = ?",
@@ -537,6 +559,110 @@ def request_recompute(db_path: str | Path, days: list[str]) -> int | None:
 # read models for the web UI
 # ---------------------------------------------------------------------------
 
+class DayChangedError(RuntimeError):
+    """A pagination cursor no longer matches the date's current publication.
+
+    Raised while serving a follow-up page when an upload, correction or
+    recompute has made the date stale or replaced its published rows since
+    the cursor was issued.  Callers must not append the page: the browser
+    discards the old list and restarts from the current publication.
+    """
+
+    def __init__(self, day: str, status: str, reason: str):
+        super().__init__(reason)
+        self.day = day
+        self.status = status
+        self.reason = reason
+
+
+def _encode_cursor(
+    day: str, publication_id: int, delivered: int, tap_time: str, event_no: str
+) -> str:
+    payload = json.dumps(
+        {
+            "v": 1,
+            "d": day,
+            "p": publication_id,
+            "n": delivered,
+            "t": tap_time,
+            "e": event_no,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_cursor(cursor: str, day: str) -> tuple[int, int, str, str]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict) or data.get("v") != 1:
+            raise ValueError("unsupported cursor")
+        publication_id = int(data["p"])
+        delivered = int(data["n"])
+        tap_time = str(data["t"])
+        event_no = str(data["e"])
+    except (ValueError, KeyError, TypeError, UnicodeError, binascii.Error) as exc:
+        raise ValueError(f"翻页游标无效：{exc}") from exc
+    if data.get("d") != day:
+        raise ValueError("翻页游标属于另一个日期")
+    if delivered < 0:
+        raise ValueError("翻页游标无效：已读条数为负")
+    return publication_id, delivered, tap_time, event_no
+
+
+def _day_summary(conn: sqlite3.Connection, day: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM day_state WHERE service_date = ?", (day,)).fetchone()
+
+
+def _pending_page(
+    conn: sqlite3.Connection,
+    day: str,
+    limit: int,
+    after: tuple[str, str] | None,
+) -> tuple[list[dict], bool]:
+    """Read at most ``limit`` pending rows from one date.
+
+    Ordering is ``(tap_time, event_no)`` — total and stable, and backed by
+    ``idx_pending_day_order``.  ``after`` is the keyset of the last row of the
+    previous page, so no offset scan or in-memory slicing is needed.  Whether
+    another page exists is settled by a one-row ``LIMIT 1`` probe, so the row
+    query itself never reads more than ``limit`` records.
+    """
+    where = "service_date = ?"
+    params: list = [day]
+    if after is not None:
+        # Row-value comparison so SQLite can seek straight to the keyset
+        # position in idx_pending_day_order instead of scanning from the day's
+        # first row on every page.
+        where += " AND (tap_time, event_no) > (?, ?)"
+        params += [after[0], after[1]]
+    rows = conn.execute(
+        "SELECT card_id, event_no, tap_time, station, direction, reason "
+        f"FROM pending_taps WHERE {where} ORDER BY tap_time, event_no LIMIT ?",
+        params + [limit],
+    ).fetchall()
+    page = [dict(row) for row in rows]
+    if len(page) < limit:
+        return page, False
+    last = page[-1]
+    probe = conn.execute(
+        "SELECT 1 FROM pending_taps WHERE service_date = ? "
+        "AND (tap_time, event_no) > (?, ?) LIMIT 1",
+        (day, last["tap_time"], last["event_no"]),
+    ).fetchone()
+    return page, probe is not None
+
+
+def _station_pairs(conn: sqlite3.Connection, day: str) -> list[dict]:
+    return [dict(row) for row in conn.execute(
+        "SELECT from_station, to_station, trips, computed_at FROM results "
+        "WHERE service_date = ? ORDER BY trips DESC, from_station, to_station",
+        (day,),
+    ).fetchall()]
+
+
 def known_days(conn: sqlite3.Connection) -> list[dict]:
     """Service dates and their publication state.
 
@@ -553,31 +679,80 @@ def known_days(conn: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def day_detail(conn: sqlite3.Connection, day: str) -> dict:
-    state = conn.execute("SELECT * FROM day_state WHERE service_date = ?", (day,)).fetchone()
-    status = state["status"] if state else "uncomputed"
-    results = []
-    pending = []
-    if status == "current":
-        results = [dict(row) for row in conn.execute(
-            "SELECT from_station, to_station, trips, computed_at FROM results "
-            "WHERE service_date = ? ORDER BY trips DESC, from_station, to_station",
-            (day,),
-        ).fetchall()]
-        pending = [dict(row) for row in conn.execute(
-            "SELECT card_id, event_no, tap_time, station, direction, reason FROM pending_taps "
-            "WHERE service_date = ? ORDER BY tap_time, event_no",
-            (day,),
-        ).fetchall()]
+def day_detail(
+    conn: sqlite3.Connection,
+    day: str,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    cursor: str | None = None,
+) -> dict:
+    """One page of a date's review list plus its publication metadata.
+
+    Everything returned (status, totals, station pairs, this page's rows) is
+    read from a single short read transaction, so it all belongs to the same
+    published version even if a recompute commits concurrently.  The
+    transaction lasts only for this request; it is never held while the
+    browser decides whether to ask for another page.
+    """
+    limit = max(1, min(int(limit), MAX_PAGE_LIMIT))
+    decoded = _decode_cursor(cursor, day) if cursor else None
+
+    with db.snapshot(conn):
+        state = _day_summary(conn, day)
+        status = state["status"] if state else "uncomputed"
+        publication_id = int(state["publication_id"]) if state else 0
+
+        if decoded is not None:
+            cursor_publication, delivered, after_time, after_event = decoded
+            if status != "current":
+                raise DayChangedError(
+                    day, status, "该日已过期或正在重算，旧清单不能再翻页"
+                )
+            if cursor_publication != publication_id:
+                raise DayChangedError(
+                    day, status, "该日已换版，旧清单不能再翻页"
+                )
+            after: tuple[str, str] | None = (after_time, after_event)
+        else:
+            delivered = 0
+            after = None
+
+        pending_total = 0
+        pending: list[dict] = []
+        pairs: list[dict] = []
+        if status == "current":
+            pending_total = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM pending_taps WHERE service_date = ?", (day,)
+                ).fetchone()["n"]
+            )
+            pending, has_more = _pending_page(conn, day, limit, after)
+            pairs = _station_pairs(conn, day)
+        else:
+            has_more = False
+
     return {
         "date": day,
         "status": status,
         "computed_at": state["computed_at"] if state else None,
         "last_error": state["last_error"] if state else None,
-        "trip_total": sum(row["trips"] for row in results),
-        "station_pairs": results,
+        "publication_id": publication_id,
+        "trip_total": sum(row["trips"] for row in pairs),
+        "station_pairs": pairs,
         "pending": pending,
-        "pending_total": len(pending),
+        "pending_total": pending_total,
+        "page": {
+            "limit": limit,
+            "returned": len(pending),
+            "delivered": delivered + len(pending),
+            "has_more": has_more,
+            "next_cursor": _encode_cursor(
+                day,
+                publication_id,
+                delivered + len(pending),
+                pending[-1]["tap_time"],
+                pending[-1]["event_no"],
+            ) if has_more else None,
+        },
     }
 
 

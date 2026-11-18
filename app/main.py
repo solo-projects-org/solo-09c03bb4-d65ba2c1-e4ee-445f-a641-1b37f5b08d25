@@ -4,7 +4,10 @@ Routes
 ------
 GET  /                      dashboard (day list, uploads, jobs)
 GET  /api/days             list of known service dates with publication state
-GET  /api/days/{date}      station-pair counts + pending taps for one date
+GET  /api/days/{date}      station-pair counts + one page (<=100) of pending taps
+                           for one date; ``cursor`` continues the list and is
+                           rejected (409) if the date was invalidated or
+                           re-published in the meantime
 POST /api/uploads          multipart CSV upload; accepted, dates invalidated,
                            then recompute is attempted inline
 POST /api/recompute        re-queue dates (repair after a failed recompute)
@@ -89,7 +92,11 @@ def api_days():
 
 
 @app.get("/api/days/{day}")
-def api_day(day: str):
+def api_day(
+    day: str,
+    limit: int = Query(default=service.DEFAULT_PAGE_LIMIT, ge=1, le=service.MAX_PAGE_LIMIT),
+    cursor: str | None = Query(default=None),
+):
     try:
         from datetime import date as date_cls
 
@@ -102,7 +109,23 @@ def api_day(day: str):
         ).fetchone()
         if not known:
             raise HTTPException(status_code=404, detail=f"没有 {day} 的数据")
-        return service.day_detail(conn, day)
+        try:
+            return service.day_detail(conn, day, limit=limit, cursor=cursor)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except service.DayChangedError as exc:
+            # The browser must discard the list it was paging through; the
+            # reason says whether the date went stale or was re-published.
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": exc.reason,
+                    "code": "day_changed",
+                    "date": exc.day,
+                    "status": exc.status,
+                    "restart": True,
+                },
+            )
 
 
 @app.get("/api/overview")

@@ -50,12 +50,31 @@ uvicorn app.main:app --port 8000
 
 ## 页面与接口
 
-* `/`：上传、按日切换查看站间人数与待核记录、批次与重算任务列表。
+* `/`：上传、按日切换查看站间人数与待核记录（分页）、批次与重算任务列表。
 * `GET /api/days`、`GET /api/days/{date}`、`GET /api/overview`
 * `POST /api/uploads`（multipart 字段 `file`）：受理后立即尝试重算，返回受影响日期及状态。
 * `POST /api/recompute?days=YYYY-MM-DD&days=...`：手动重算（用于失败后的修复）。
 
 `/docs` 有 OpenAPI 交互文档。
+
+## 待核清单分页
+
+待核记录可能上万条，接口不会整日读回再由应用切片：
+
+* `GET /api/days/{date}?limit=100&cursor=...` 每次最多返回 100 条（`limit` 上限也是
+  100，超过返回 422）。SQL 用 `WHERE service_date = ? AND (tap_time, event_no) > (?, ?)`
+  加 `ORDER BY tap_time, event_no LIMIT ?` 走 `idx_pending_day_order` 索引键集翻页，
+  不做 offset 扫描；是否还有下一页由一条 `LIMIT 1` 探测决定。首屏仍带当天全部
+  `station_pairs` 与 `pending_total`（`COUNT(*)`），并附带 `publication_id`、`page.next_cursor`。
+* **一致性**：状态、`trip_total`、`station_pairs`、`pending_total` 与本页记录在同一个短读事务
+  （`BEGIN` … `COMMIT`）里读出，全部来自同一次现行发布。事务只在本次请求内持有，请求结束即
+  释放，翻页等待期间不占用 SQLite，读走 WAL 快照也不会阻塞上传写入。
+* **翻页失效**：每次发布事务分配一个全局递增的 `publication_id` 写入 `day_state`。游标绑定
+  “日期 + publication_id + 已读条数 + 末行 `(tap_time, event_no)`”。翻页时若该日已因补传/更正
+  变为 `stale`，或已被重算换成新 `publication_id`，接口返回 **409**
+  `{"code":"day_changed","status":...,"restart":true}`，绝不把两版记录拼在一起。页面收到后
+  清空旧清单，提示“旧清单已清空，请从现行结果重新开始”，并提供重新加载（或重算）按钮。
+* 旧库启动时 `init_db` 会为 `day_state` 补加 `publication_id` 列；`recover()` 的既有语义不变。
 
 ## 已知限制
 
@@ -66,6 +85,8 @@ uvicorn app.main:app --port 8000
   `MAX_JOB_ATTEMPTS` 次后标记为 `failed`，不会无限重试。
 * **重复上传幂等**：若文件内容与库内完全一致（无新事件），不会把日期标为过期，只记一条空批次。
 * 页面对 `stale` 日期不展示旧数字，只显示过期提示与错误原因；历史批次与任务仍可审计。
+* 待核清单是按日的；站间人数表一次返回整日聚合结果（约“站点对数”量级，通常远小于待核
+  条数），未分页。
 
 ## 测试
 
@@ -75,4 +96,7 @@ python3 -m pytest tests -q
 ```
 
 覆盖：配对规则与跨午夜归属、低修订忽略、上传受理即过期、跨日更正两日联合发布、
-重算失败保持过期并可修复、重启恢复不误标现行、慢任务被新修订拦截、多进程并发上传收敛到最高修订。
+重算失败保持过期并可修复、重启恢复不误标现行、慢任务被新修订拦截、多进程并发上传收敛到最高修订；
+以及 `tests/test_paging.py` 的分页上限、`(tap_time, event_no)` 稳定排序与去重、超限
+`limit` 拒绝、跨日/坏游标拒绝、补传后与 stale 后旧游标返回 409、分页读取不遗留事务、
+旧库补列迁移。
